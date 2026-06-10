@@ -1,0 +1,60 @@
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  --bg: #fdf6f0;
+  --bg-warm: #faefe6;
+  --surface: rgba(255, 255, 255, 0.88);
+  --surface-solid: #fffcfa;
+  --border: rgba(220, 190, 170, 0.35);
+  --border-light: rgba(235, 210, 195, 0.5);
+  --text: #3d2e28;
+  --text-secondary: #7a655c;
+  --text-muted: #b09a8f;
+  --user-message-bg: linear-gradient(135deg, #fff5ee 0%, #fde8dc 100%);
+  --user-message-border: rgba(232, 180, 150, 0.35);
+  --ai-card-bg: rgba(255, 255, 255, 0.92);
+  --accent: #d4848a;
+  --accent-soft: #f5e4e6;
+  --accent-warm: #e8a87c;
+  --accent-sage: #b8cdb8;
+  --therapy-summary: #faf3ee;
+  --therapy-emotion: #f8eef5;
+  --therapy-step: linear-gradient(145deg, #fff8f4 0%, #fdf0ea 100%);
+  --pink-badge: #d4848a;
+  --shadow-sm: 0 2px 12px rgba(160, 110, 80, 0.06);
+  --shadow-md: 0 8px 32px rgba(160, 110, 80, 0.1);
+  --shadow-glow: 0 0 40px rgba(232, 168, 124, 0.15);
+  --radius-pill: 999px;
+  --radius-lg: 18px;
+  --radius-xl: 22px;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  font-family: 'Noto Sans SC', -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Segoe UI', sans-serif;
+  background: linear-gradient(165deg, var(--bg) 0%, var(--bg-warm) 45%, #f8ebe3 100%);
+  background-attachment: fixed;
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  font-family: inherit;
+}
+
+button:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid rgba(212, 132, 138, 0.45);
+  outline-offset: 2px;
+}
