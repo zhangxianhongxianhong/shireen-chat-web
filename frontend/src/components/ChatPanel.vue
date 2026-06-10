@@ -1,13 +1,65 @@
 <script setup>
-import { ref, nextTick, onMounted } from 'vue'
+import { ref, watch, nextTick, onMounted } from 'vue'
 import { streamChat, clearConversation } from '../api/chat.js'
+import { loadChatSession, saveChatSession, clearChatSession } from '../utils/chatSession.js'
+import { detectCrisis } from '../utils/crisis.js'
+import { friendlyNetworkError, friendlyStreamError } from '../utils/errors.js'
 import ShireenAvatar from './ShireenAvatar.vue'
+
+const MAX_INPUT_LENGTH = 800
 
 const messages = ref([])
 const input = ref('')
+const inputHint = ref('')
 const loading = ref(false)
 const chatContainer = ref(null)
 const showMenu = ref(false)
+const showAbout = ref(false)
+
+const featureSections = [
+  {
+    title: '基础功能',
+    items: [
+      '一键复制 AI 回答',
+      '一键清空输入框',
+      '响应式 UI，适配手机与电脑',
+      '识别极端情绪时，引导拨打紧急服务电话（如 110）',
+      '引导文案与使用示例，降低上手成本',
+    ],
+  },
+  {
+    title: '输入字数限制',
+    items: [
+      '上限 800 字，适合一段日记/感受的长度',
+      '右下角显示「当前字数/800」',
+      '达到 90%（720 字）时计数变橙色提醒',
+      '达到 800 字时变粉色，无法继续输入',
+      '超限或为空时禁用发送按钮',
+      '后端同步校验 max_length=800',
+    ],
+  },
+  {
+    title: '历史对话',
+    items: ['对话自动保存在本机浏览器', '刷新网页后恢复聊天现场', '「开始新对话」可清空当前记录'],
+  },
+  {
+    title: '健壮性',
+    items: [
+      '空输入、纯空格、超长文本校验与提示',
+      '网络异常、超时、接口报错友好文案',
+      '不向用户展示原始 API 错误信息',
+    ],
+  },
+]
+
+const fallbackRows = [
+  { scene: '网络异常', show: '「网络不太稳定，请检查连接后重试。」', action: '前端捕获；后端可降级模板' },
+  { scene: '请求超时（90s）', show: '「请求超时，请稍后再试。」', action: '超时后降级模板' },
+  { scene: '接口报错（500 等）', show: '「服务暂时不可用，请稍后再试。」', action: '千问失败 → 模板' },
+  { scene: '配额不足', show: '「AI 服务额度不足…」+ 降级提示条', action: '识别 quota → 模板' },
+  { scene: '降级到模板', show: '灰色提示条 + 正常三张卡片', action: '不阻断使用' },
+  { scene: '彻底失败', show: '粉色错误气泡', action: '仅展示友好文案' },
+]
 const copiedIndex = ref(-1)
 const savedSet = ref(new Set())
 let abortController = null
@@ -20,19 +72,40 @@ function scrollToBottom() {
   })
 }
 
+function validateInput(text) {
+  if (!text) {
+    inputHint.value = '请先输入你的感受或日记内容'
+    return false
+  }
+  if (text.length > MAX_INPUT_LENGTH) {
+    inputHint.value = `内容过长，请控制在 ${MAX_INPUT_LENGTH} 字以内`
+    return false
+  }
+  if (!/\S/.test(text)) {
+    inputHint.value = '请输入有效文字内容'
+    return false
+  }
+  inputHint.value = ''
+  return true
+}
+
 async function sendMessage() {
   const text = input.value.trim()
-  if (!text || loading.value) return
+  if (loading.value || !validateInput(text)) return
 
   messages.value.push({ role: 'user', content: text })
   input.value = ''
   loading.value = true
   scrollToBottom()
 
+  const lang = hasChinese(text) ? 'zh' : 'en'
+  const crisisAlert = detectCrisis(text)
   const botMsg = {
     role: 'assistant',
     content: '',
     streaming: true,
+    lang,
+    crisisAlert,
   }
   messages.value.push(botMsg)
   const botIndex = messages.value.length - 1
@@ -48,31 +121,43 @@ async function sendMessage() {
     await streamChat({
       query: text,
       history,
+      lang,
       signal: abortController.signal,
       onChunk(data) {
+        if (data.event === 'provider_fallback') {
+          messages.value[botIndex].fallbackNotice = data.notice || ''
+          messages.value[botIndex].isTemplate = true
+        }
         if (data.event === 'message' && data.answer != null && data.answer !== '') {
           messages.value[botIndex].content += data.answer
+          messages.value[botIndex].isError = false
           scrollToBottom()
         }
         if (data.event === 'error') {
-          messages.value[botIndex].content = data.message || '请求失败'
+          messages.value[botIndex].isError = true
+          messages.value[botIndex].content = friendlyStreamError(data, lang)
         }
       },
       onDone() {
         messages.value[botIndex].streaming = false
-        const parsed = parseTherapyResponse(messages.value[botIndex].content)
-        if (parsed) messages.value[botIndex].parsed = parsed
+        const parsed = parseTherapyResponse(messages.value[botIndex].content, lang)
+        if (parsed) {
+          messages.value[botIndex].parsed = parsed
+          messages.value[botIndex].isError = false
+        }
       },
     })
   } catch (err) {
     if (err.name !== 'AbortError') {
-      messages.value[botIndex].content = err.message || '网络错误，请重试'
+      messages.value[botIndex].isError = true
+      messages.value[botIndex].content = friendlyNetworkError(err, lang) || err.message
     }
     messages.value[botIndex].streaming = false
   } finally {
     loading.value = false
     messages.value[botIndex].streaming = false
     abortController = null
+    saveChatSession(messages.value)
     scrollToBottom()
   }
 }
@@ -87,10 +172,32 @@ function handleKeydown(e) {
 function newChat() {
   if (loading.value && abortController) abortController.abort()
   clearConversation()
+  clearChatSession()
   messages.value = []
   loading.value = false
   showMenu.value = false
 }
+
+function restoreSession() {
+  const stored = loadChatSession()
+  if (!stored.length) return
+
+  messages.value = stored.map((msg) => {
+    if (msg.role === 'assistant' && msg.content && !msg.parsed) {
+      const parsed = parseTherapyResponse(msg.content, msg.lang)
+      if (parsed) return { ...msg, parsed }
+    }
+    return msg
+  })
+}
+
+watch(
+  messages,
+  (msgs) => {
+    if (!loading.value) saveChatSession(msgs)
+  },
+  { deep: true },
+)
 
 async function copyMessage(index, content) {
   try {
@@ -100,11 +207,15 @@ async function copyMessage(index, content) {
   } catch { /* ignore */ }
 }
 
+function hasChinese(text) {
+  return /[\u4e00-\u9fff\u3400-\u4dbf]/.test(text)
+}
+
 function speakMessage(content, parsed) {
   window.speechSynthesis?.cancel()
   const text = parsed?.gentle_next_step || content
   const utter = new SpeechSynthesisUtterance(text)
-  utter.lang = 'zh-CN'
+  utter.lang = parsed?.lang === 'en' ? 'en-US' : 'zh-CN'
   window.speechSynthesis?.speak(utter)
 }
 
@@ -114,19 +225,47 @@ function toggleSave(index) {
   savedSet.value = new Set(savedSet.value)
 }
 
-function parseTherapyResponse(content) {
+function normalizeTherapyJson(json) {
+  if (json['感受摘要'] && json['核心情绪'] && json['温暖的小建议']) {
+    return {
+      lang: 'zh',
+      summary: json['感受摘要'],
+      key_emotion: json['核心情绪'],
+      gentle_next_step: json['温暖的小建议'],
+    }
+  }
+  if (json.summary && json.key_emotion && json.gentle_next_step) {
+    return {
+      lang: 'en',
+      summary: json.summary,
+      key_emotion: json.key_emotion,
+      gentle_next_step: json.gentle_next_step,
+    }
+  }
+  return null
+}
+
+function parseTherapyResponse(content, userLang) {
   if (!content) return null
   const tryParse = (text) => {
     try {
-      const json = JSON.parse(text.trim())
-      if (json.summary && json.key_emotion && json.gentle_next_step) return json
+      const parsed = normalizeTherapyJson(JSON.parse(text.trim()))
+      if (parsed) return parsed
     } catch { /* ignore */ }
     return null
   }
   const direct = tryParse(content)
-  if (direct) return direct
   const match = content.match(/\{[\s\S]*\}/)
-  return match ? tryParse(match[0]) : null
+  const parsed = direct || (match ? tryParse(match[0]) : null)
+  if (parsed && userLang) parsed.lang = userLang
+  return parsed
+}
+
+function therapyLabels(lang) {
+  if (lang === 'zh') {
+    return { summary: '感受摘要', emotion: '核心情绪', nextStep: '温暖的小建议' }
+  }
+  return { summary: 'Summary', emotion: 'Key emotion', nextStep: 'Gentle next step' }
 }
 
 function displayContent(content, parsed) {
@@ -144,9 +283,16 @@ const suggestions = [
 
 function useSuggestion(text) {
   input.value = text
+  inputHint.value = ''
+}
+
+function clearInput() {
+  input.value = ''
+  inputHint.value = ''
 }
 
 onMounted(() => {
+  restoreSession()
   scrollToBottom()
   document.addEventListener('click', () => { showMenu.value = false })
 })
@@ -173,9 +319,57 @@ onMounted(() => {
           </svg>
           <div v-if="showMenu" class="dropdown-menu">
             <button @click="newChat">开始新对话</button>
+            <button @click="showMenu = false; showAbout = true">功能说明</button>
           </div>
         </div>
+        <button type="button" class="about-btn" title="功能说明" @click="showAbout = true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+            <circle cx="12" cy="12" r="10"/>
+            <path d="M12 16v-4M12 8h.01" stroke-linecap="round"/>
+          </svg>
+        </button>
       </header>
+
+      <div v-if="showAbout" class="about-overlay" @click.self="showAbout = false">
+        <div class="about-panel" role="dialog" aria-labelledby="about-title">
+          <div class="about-header">
+            <h2 id="about-title" class="about-title">功能说明</h2>
+            <button type="button" class="about-close" aria-label="关闭" @click="showAbout = false">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M18 6L6 18M6 6l12 12" stroke-linecap="round"/>
+              </svg>
+            </button>
+          </div>
+          <div class="about-body">
+            <section v-for="section in featureSections" :key="section.title" class="about-section">
+              <h3 class="about-section-title">{{ section.title }}</h3>
+              <ul class="about-list">
+                <li v-for="item in section.items" :key="item">{{ item }}</li>
+              </ul>
+            </section>
+            <section class="about-section">
+              <h3 class="about-section-title">Fallback 机制</h3>
+              <div class="fallback-table-wrap">
+                <table class="fallback-table">
+                  <thead>
+                    <tr>
+                      <th>场景</th>
+                      <th>用户看到</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="row in fallbackRows" :key="row.scene">
+                      <td>{{ row.scene }}</td>
+                      <td>{{ row.show }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </section>
+            <p class="about-note">Shireen 提供情绪支持，不能替代专业医疗或心理咨询。遇紧急危险请立即拨打 110。</p>
+          </div>
+        </div>
+      </div>
 
       <main class="chat-area" ref="chatContainer">
         <div v-if="messages.length === 0" class="empty-state">
@@ -209,21 +403,31 @@ onMounted(() => {
                 <span class="dots"><span></span><span></span><span></span></span>
               </div>
               <template v-else>
+                <div v-if="msg.crisisAlert" class="crisis-alert">
+                  <p class="crisis-alert-title">你并不孤单，请优先保障自身安全</p>
+                  <p class="crisis-alert-text">
+                    如果你正处于紧急危险中，或有伤害自己的想法，请立即拨打
+                    <a href="tel:110">110</a>
+                    或当地紧急服务电话。也可拨打全国心理援助热线
+                    <a href="tel:4001619995">400-161-9995</a>。
+                  </p>
+                </div>
+                <p v-if="msg.fallbackNotice" class="fallback-notice">{{ msg.fallbackNotice }}</p>
                 <div v-if="msg.parsed" class="therapy-response">
                   <div class="therapy-section therapy-section--summary">
-                    <span class="therapy-label">感受摘要</span>
+                    <span class="therapy-label">{{ therapyLabels(msg.parsed.lang || msg.lang).summary }}</span>
                     <p class="therapy-text">{{ msg.parsed.summary }}</p>
                   </div>
                   <div class="therapy-section therapy-section--emotion">
-                    <span class="therapy-label">核心情绪</span>
+                    <span class="therapy-label">{{ therapyLabels(msg.parsed.lang || msg.lang).emotion }}</span>
                     <p class="therapy-emotion">{{ msg.parsed.key_emotion }}</p>
                   </div>
                   <div class="therapy-section therapy-step">
-                    <span class="therapy-label">温暖的小建议</span>
+                    <span class="therapy-label">{{ therapyLabels(msg.parsed.lang || msg.lang).nextStep }}</span>
                     <p class="therapy-text therapy-text--step">{{ msg.parsed.gentle_next_step }}</p>
                   </div>
                 </div>
-                <p v-else-if="msg.content" class="ai-text">{{ msg.content }}</p>
+                <p v-else-if="msg.content" class="ai-text" :class="{ 'ai-text--error': msg.isError }">{{ msg.content }}</p>
                 <div v-if="!msg.streaming && msg.content" class="msg-actions">
                 <button class="action-btn" title="朗读" @click="speakMessage(msg.content, msg.parsed)">
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
@@ -264,17 +468,41 @@ onMounted(() => {
             class="input-field"
             placeholder="写下你的感受或今天的日记…"
             rows="2"
+            :maxlength="MAX_INPUT_LENGTH"
             :disabled="loading"
             @keydown="handleKeydown"
+            @input="inputHint = ''"
           />
 
           <div class="input-toolbar">
-            <span class="input-hint">Enter 发送 · Shift+Enter 换行</span>
-            <button
+            <span class="input-hint" :class="{ 'input-hint--warn': inputHint }">
+              {{ inputHint || 'Enter 发送 · Shift+Enter 换行' }}
+            </span>
+            <div class="input-actions">
+              <button
+                v-if="input"
+                type="button"
+                class="clear-input-btn"
+                title="清空输入"
+                :disabled="loading"
+                @click="clearInput"
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                  <path d="M18 6L6 18M6 6l12 12" stroke-linecap="round"/>
+                </svg>
+              </button>
+              <span
+                class="char-count"
+                :class="{
+                  'char-count--warn': input.length >= MAX_INPUT_LENGTH * 0.9,
+                  'char-count--limit': input.length >= MAX_INPUT_LENGTH,
+                }"
+              >{{ input.length }}/{{ MAX_INPUT_LENGTH }}</span>
+              <button
               class="send-btn"
-              :class="{ active: input.trim() && !loading }"
+              :class="{ active: input.trim() && !loading && input.length <= MAX_INPUT_LENGTH }"
               type="button"
-              :disabled="!input.trim() || loading"
+              :disabled="!input.trim() || loading || input.length > MAX_INPUT_LENGTH"
               @click="sendMessage"
             >
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -282,6 +510,7 @@ onMounted(() => {
                 <polygon points="22 2 15 22 11 13 2 9 22 2"/>
               </svg>
             </button>
+            </div>
           </div>
         </div>
 
@@ -350,8 +579,229 @@ onMounted(() => {
 }
 
 .top-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   padding: 20px 0 12px;
   flex-shrink: 0;
+}
+
+.about-btn {
+  width: 40px;
+  height: 40px;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--surface);
+  color: var(--text-secondary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  box-shadow: var(--shadow-sm);
+  transition: background 0.15s, color 0.15s;
+}
+
+.about-btn:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.about-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: rgba(61, 46, 40, 0.35);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+.about-panel {
+  width: 100%;
+  max-width: 420px;
+  max-height: min(85vh, 640px);
+  background: var(--surface-solid);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-md);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.about-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 20px 14px;
+  border-bottom: 1px solid var(--border-light);
+  flex-shrink: 0;
+}
+
+.about-title {
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.about-close {
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s, color 0.15s;
+}
+
+.about-close:hover {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.about-body {
+  padding: 16px 20px 20px;
+  overflow-y: auto;
+}
+
+.about-section {
+  margin-bottom: 16px;
+}
+
+.about-section-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent);
+  margin-bottom: 6px;
+}
+
+.about-list {
+  list-style: none;
+  padding: 0;
+}
+
+.about-list li {
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.65;
+  padding: 2px 0 2px 12px;
+  position: relative;
+}
+
+.about-list li::before {
+  content: '·';
+  position: absolute;
+  left: 0;
+  color: var(--text-muted);
+}
+
+.fallback-table-wrap {
+  overflow-x: auto;
+  margin: 0 -4px;
+}
+
+.fallback-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+
+.fallback-table th,
+.fallback-table td {
+  border: 1px solid var(--border-light);
+  padding: 6px 8px;
+  text-align: left;
+  vertical-align: top;
+  line-height: 1.5;
+}
+
+.fallback-table th {
+  background: var(--therapy-summary);
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.fallback-table td {
+  color: var(--text-secondary);
+}
+
+.fallback-table td:first-child {
+  white-space: nowrap;
+  color: var(--text);
+  font-weight: 500;
+}
+
+.crisis-alert {
+  background: rgba(212, 132, 138, 0.12);
+  border: 1px solid rgba(212, 132, 138, 0.35);
+  border-radius: 12px;
+  padding: 12px 14px;
+  margin-bottom: 12px;
+}
+
+.crisis-alert-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #b85c5c;
+  margin-bottom: 6px;
+}
+
+.crisis-alert-text {
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.65;
+}
+
+.crisis-alert a {
+  color: #b85c5c;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.crisis-alert a:hover {
+  text-decoration: underline;
+}
+
+.clear-input-btn {
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: background 0.15s, color 0.15s;
+}
+
+.clear-input-btn:hover:not(:disabled) {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.clear-input-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.about-note {
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.6;
+  margin-top: 8px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border-light);
 }
 
 .dropdown {
@@ -738,6 +1188,49 @@ onMounted(() => {
 .input-hint {
   font-size: 11px;
   color: var(--text-muted);
+}
+
+.input-hint--warn {
+  color: #d4848a;
+}
+
+.fallback-notice {
+  font-size: 12px;
+  color: var(--text-muted);
+  background: rgba(232, 168, 124, 0.12);
+  border-radius: 10px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  line-height: 1.5;
+}
+
+.ai-text--error {
+  color: #b85c5c;
+  background: rgba(212, 132, 138, 0.08);
+  border-radius: 12px;
+  padding: 12px 14px;
+}
+
+.input-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.char-count {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.char-count--warn {
+  color: #c9876b;
+}
+
+.char-count--limit {
+  color: #d4848a;
+  font-weight: 500;
 }
 
 .send-btn {

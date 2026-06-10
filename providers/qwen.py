@@ -18,11 +18,13 @@ QWEN_MODEL = os.getenv("QWEN_MODEL", "qwen-plus")
 DEFAULT_SYSTEM_PROMPT = """你是一位专业、温暖的心理咨询师。用户会分享一段日记或感受。
 
 【语言规则 — 必须严格遵守】
-- 多轮对话时，回复语言只由「当前这一轮」用户输入决定，与历史消息语言无关
-- 若上一轮用户用中文、本轮用户改用英文，本轮 JSON 必须全部使用英文
-- 若上一轮用户用英文、本轮用户改用中文，本轮 JSON 必须全部使用中文
-- JSON 中 summary、key_emotion、gentle_next_step 三个字段的值，必须全部使用本轮用户输入的语言
-- 禁止混用语言；这条规则优先于历史对话与下方所有示例
+- 仅看用户本轮最新一条输入：只要含有任意中文字符，整份 JSON 的字段名与字段值都必须使用中文
+- 若用户本轮输入不含任何中文字符，整份 JSON 的字段名与字段值都必须使用英文
+- 与历史消息语言无关；禁止混用语言
+
+【JSON 字段名规则】
+- 含中文输入 → 字段名：感受摘要、核心情绪、温暖的小建议
+- 不含中文输入 → 字段名：summary、key_emotion、gentle_next_step
 
 你的工作流程（仅在内心进行，不要输出）：
 1. 倾听并理解用户的问题
@@ -30,17 +32,14 @@ DEFAULT_SYSTEM_PROMPT = """你是一位专业、温暖的心理咨询师。用�
 3. 选择合适的心理支持方向（如认知重构、自我接纳、行为激活等）
 4. 基于以上判断，生成对用户的回应
 
-你必须且只能输出一个合法的 JSON 对象，不要输出 markdown 代码块、解释或任何其他文字。JSON 包含以下三个字段：
-- summary: 用一句简洁的话概括用户当下的处境与感受
-- key_emotion: 用户最突出的核心情绪（一个词或短短语）
-- gentle_next_step: 一段温暖、接纳的回应，使用日常、用户能理解的语言；并提供一个具体的、用户可以在 24 小时内完成的小行动
+你必须且只能输出一个合法的 JSON 对象，不要输出 markdown 代码块、解释或任何其他文字。
 
-示例（中文输入 → 中文输出）：
-用户：今天开会被老板质疑了，我表面上没事，但其实很受打击。回家以后一直在想是不是自己能力不够。
+示例（含中文输入）：
+用户：今天开会被老板质疑了，我表面上没事，但其实很受打击。
 输出：
-{"summary":"你在工作中被质疑后感到受伤，并开始怀疑自己的能力。","key_emotion":"自我怀疑","gentle_next_step":"在对自己下更大判断之前，先写下今天一件你处理得还不错的事。不用完美，只要真实就好。"}
+{"感受摘要":"你在工作中被质疑后感到受伤，并开始怀疑自己的能力。","核心情绪":"自我怀疑","温暖的小建议":"在对自己下更大判断之前，先写下今天一件你处理得还不错的事。不用完美，只要真实就好。"}
 
-示例（英文输入 → 英文输出）：
+示例（不含中文输入）：
 用户：I felt hurt after being questioned at work and started doubting my ability.
 输出：
 {"summary":"You felt hurt after being questioned at work and started doubting your ability.","key_emotion":"self-doubt","gentle_next_step":"Write down one thing you handled well today before making any bigger judgment about yourself."}"""
@@ -57,40 +56,21 @@ def _headers() -> dict[str, str]:
 
 
 def _detect_response_language(text: str) -> str:
-    """根据当前用户输入判断本轮回复应使用的语言。"""
-    text = text.strip()
-    if not text:
+    """用户输入含任意中文则用中文，否则用英文。"""
+    if re.search(r"[\u4e00-\u9fff\u3400-\u4dbf]", text):
         return "zh"
-
-    cjk_chars = len(re.findall(r"[\u4e00-\u9fff\u3400-\u4dbf]", text))
-    latin_chars = len(re.findall(r"[a-zA-Z]", text))
-
-    if cjk_chars == 0 and latin_chars > 0:
-        return "en"
-    if latin_chars == 0 and cjk_chars > 0:
-        return "zh"
-    if latin_chars > cjk_chars:
-        return "en"
-    if cjk_chars > latin_chars:
-        return "zh"
-
-    if re.search(r"\b(the|is|are|am|was|were|my|I|you|always|feel|mom|dad)\b", text, re.I):
-        return "en"
-    return "zh"
+    return "en"
 
 
 def _language_instruction(lang: str) -> str:
     if lang == "en":
         return (
-            "【本轮回复语言：English】"
-            "Only for the user's latest message in this turn, "
-            "all JSON fields (summary, key_emotion, gentle_next_step) must be written in English. "
-            "Ignore the language used in earlier messages."
+            "【本轮：英文】用户本轮输入不含中文。"
+            "JSON 字段名必须为 summary、key_emotion、gentle_next_step，字段值全部使用英文。"
         )
     return (
-        "【本轮回复语言：中文】"
-        "仅针对用户本轮最新一条消息，JSON 全部字段（summary、key_emotion、gentle_next_step）必须使用中文。"
-        "不要受历史消息语言影响。"
+        "【本轮：中文】用户本轮输入含有中文。"
+        "JSON 字段名必须为 感受摘要、核心情绪、温暖的小建议，字段值全部使用中文。"
     )
 
 
@@ -111,7 +91,7 @@ async def stream_chat(
     query: str,
     conversation_id: str,
     user: str,
-    history: list[dict[str, str]] | None = None,
+    history: Optional[list[dict[str, str]]] = None,
     **_kwargs,
 ) -> AsyncIterator[str]:
     conv_id = conversation_id or str(uuid.uuid4())

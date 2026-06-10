@@ -1,3 +1,5 @@
+import { CHAT_TIMEOUT_MS, friendlyHttpError } from '../utils/errors.js'
+
 const USER_ID_KEY = 'dify_chat_user_id'
 const CONVERSATION_ID_KEY = 'dify_chat_conversation_id'
 
@@ -39,24 +41,50 @@ function parseSSELine(line) {
 /**
  * 流式对话。每收到一行 data: 立即回调，不等待完整 SSE 事件块。
  */
-export async function streamChat({ query, history = [], onChunk, onDone, signal }) {
-  const response = await fetch('/api/chat', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      query,
-      conversation_id: getConversationId(),
-      user: getUserId(),
-      history,
-      inputs: {},
-      files: [],
-    }),
-    signal,
-  })
+export async function streamChat({ query, history = [], onChunk, onDone, signal, lang = 'zh' }) {
+  const timeoutController = new AbortController()
+  let timedOut = false
+  const timeoutId = setTimeout(() => {
+    timedOut = true
+    timeoutController.abort()
+  }, CHAT_TIMEOUT_MS)
+
+  const onAbort = () => timeoutController.abort()
+  if (signal) {
+    if (signal.aborted) timeoutController.abort()
+    else signal.addEventListener('abort', onAbort, { once: true })
+  }
+
+  let response
+  try {
+    response = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        query,
+        conversation_id: getConversationId(),
+        user: getUserId(),
+        history,
+        inputs: {},
+        files: [],
+      }),
+      signal: timeoutController.signal,
+    })
+  } catch (err) {
+    if (timedOut) {
+      const timeoutErr = new Error('timeout')
+      timeoutErr.name = 'TimeoutError'
+      throw timeoutErr
+    }
+    throw err
+  } finally {
+    clearTimeout(timeoutId)
+    if (signal) signal.removeEventListener('abort', onAbort)
+  }
 
   if (!response.ok) {
     const text = await response.text()
-    throw new Error(text || `HTTP ${response.status}`)
+    throw new Error(friendlyHttpError(response.status, text, lang))
   }
 
   const reader = response.body.getReader()

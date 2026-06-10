@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from providers import dify, qwen
+from providers import router
 
 CHAT_PROVIDER = os.getenv("CHAT_PROVIDER", "qwen").lower()
 
@@ -38,7 +38,7 @@ class ChatMessage(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    query: str = Field(..., min_length=1, max_length=4000)
+    query: str = Field(..., min_length=1, max_length=800)
     conversation_id: str = ""
     user: str = ""
     history: list[ChatMessage] = Field(default_factory=list)
@@ -65,21 +65,14 @@ async def health():
 async def chat(request: ChatRequest):
     user_id = request.user or f"user-{uuid.uuid4().hex[:12]}"
 
-    if CHAT_PROVIDER == "dify":
-        stream = dify.stream_chat(
-            query=request.query,
-            conversation_id=request.conversation_id,
-            user=user_id,
-            inputs=request.inputs,
-            files=[f.model_dump() for f in request.files],
-        )
-    else:
-        stream = qwen.stream_chat(
-            query=request.query,
-            conversation_id=request.conversation_id,
-            user=user_id,
-            history=[m.model_dump() for m in request.history],
-        )
+    stream = router.stream_chat(
+        query=request.query,
+        conversation_id=request.conversation_id,
+        user=user_id,
+        history=[m.model_dump() for m in request.history],
+        inputs=request.inputs,
+        files=[f.model_dump() for f in request.files],
+    )
 
     return StreamingResponse(
         stream,
