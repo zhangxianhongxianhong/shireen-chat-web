@@ -4,12 +4,12 @@
   "outputDirectory": "frontend/dist",
   "installCommand": "pip install -r requirements.txt",
   "functions": {
-    "app.py": {
+    "api/index.py": {
       "maxDuration": 60
     }
   },
   "rewrites": [
-    { "source": "/api/(.*)", "destination": "/app.py" },
+    { "source": "/api/(.*)", "destination": "/api/index.py" },
     { "source": "/(.*)", "destination": "/index.html" }
   ]
 }
