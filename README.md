@@ -1,4 +1,4 @@
-# Dify Chat Web
+# Shireen Chat Web
 
 基于 **Vue 3 + FastAPI** 的对话网站，后端支持 **通义千问** 与 **Dify** 双 Provider 切换，API Key 仅存服务端，可部署到 Vercel。
 
